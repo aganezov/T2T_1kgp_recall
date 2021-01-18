@@ -14,6 +14,7 @@ known_indels = "/scratch/groups/mschatz1/aganezov/CHM13/variants/1000G/from_ena/
 sample = config.get("sample", "ERR3239800")
 sample_cram = config.get("cram", os.path.join(out_dir, f"{sample}.final.cram"))
 clean_rname = config.get("clean_rnames", True)
+enable_gatk_spark = config.get("enable_gatk_spark", False)
 
 rule finish:
     input:
@@ -69,7 +70,7 @@ rule bam_to_cram:
     shell: "samtools view -C -T {input.target_ref} -o {output} {input.bam}"
 
 rule recalibrate_bam:
-    output: os.path.join(out_dir, "{sample,[^._]+}.recalibrated.sort.bam")
+    output: temp(os.path.join(out_dir, "{sample,[^._]+}.recalibrated.sort.bam"))
     input:
         table=os.path.join(out_dir, "{sample}.recal.table"),
         dedup_sorted_bam=os.path.join(out_dir, "{sample}.dedup.sort.bam"),
@@ -81,11 +82,13 @@ rule recalibrate_bam:
     params:
         gatk_cli="~/code/aganezov/gatk-4.1.9.0/gatk",
         java_options='--java-options \"-Xmx32G -XX:ParallelGCThreads=4 -Djava.io.tmpdir=/dev/shm\"',
+        parallelism_options=lambda wc, threads: f"--spark-runner LOCAL --spark-master \'local[{threads}]\'" if enable_gatk_spark else "",
+        tool="ApplyBQSRSpark" if enable_gatk_spark else "ApplyBQSR"
     shell:
         "{params.gatk_cli}"
-        " ApplyBQSRSpark"
+        " {params.tool}"
         " {params.java_options}"
-        " --spark-runner LOCAL --spark-master \'local[{threads}]\'"
+        " {params.parallelism_options}"
         " --preserve-qscores-less-than 6"
         " --static-quantized-quals 10"
         " --static-quantized-quals 20"
@@ -109,12 +112,18 @@ rule get_recalibration_table:
         target_ref=reference,
     log: os.path.join(out_dir, "log", "{sample}.recal.table.log")
     benchmark: os.path.join(out_dir, "benchmark", "{sample}.recal.table")
+    threads: 24
     params:
         autosomes_flag = " ".join(f"-L {c}" for c in autosomes),
-        gatk_cli=gatk
+        gatk_cli="~/code/aganezov/gatk-4.1.9.0/gatk",
+        java_options='--java-options \"-Xmx32G -XX:ParallelGCThreads=4 -Djava.io.tmpdir=/dev/shm\"',
+        parallelism_options=lambda wc, threads: f"--spark-runner LOCAL --spark-master \'local[{threads}]\'" if enable_gatk_spark else "",
+        tool="BaseRecalibratorSpark" if enable_gatk_spark else "BaseRecalibrator"
     shell:
         "{params.gatk_cli}"
-        " BaseRecalibrator"
+        " {params.tool}"
+        " {params.java_options}"
+        " {params.parallelism_options}"
         " --preserve-qscores-less-than 6"
         " {params.autosomes_flag}"
         " -R {input.target_ref}"
@@ -126,7 +135,7 @@ rule get_recalibration_table:
         " 2> {log}"
 
 rule index_dedup_bam:
-    output: os.path.join(out_dir, "{sample,[^._]+}.dedup.sort.bam.bai")
+    output: temp(os.path.join(out_dir, "{sample,[^._]+}.dedup.sort.bam.bai"))
     input: os.path.join(out_dir, "{sample}.dedup.sort.bam")
     threads: 24
     log: os.path.join(out_dir, "log", "{sample}.dedup.sort.bam.bai.log")
@@ -136,7 +145,7 @@ rule index_dedup_bam:
 
 
 rule mark_duplicates:
-    output: os.path.join(out_dir, "{sample,[^._]+}.dedup.sort.bam")
+    output: temp(os.path.join(out_dir, "{sample,[^._]+}.dedup.sort.bam"))
     input: sorted_bam=os.path.join(out_dir, "{sample}.sort.bam")
     params:
         dedup_metrics = lambda wc: os.path.join(out_dir, f"{wc.sample}.txt"),
@@ -145,7 +154,7 @@ rule mark_duplicates:
         tmp_dir=lambda wc: os.path.join(out_dir, f"samtools_{wc.sample}"),
     log: os.path.join(out_dir, "log", "{sample}.dedup.sort.bam.log")
     benchmark: os.path.join(out_dir, "benchmark", "{sample}.dedup.bam")
-    threads: 5
+    threads: 24
     shell:
         "mkdir -p {params.tmp_dir} &&"
         " samtools"
@@ -165,7 +174,7 @@ def aggregate_lanes(wildcards):
     return glob_wildcards(os.path.join(
         checkpoint_output,
         f"{wildcards.sample}_1_fastq",
-        f"{wildcards.sample}_1." + "{lane}.fastq")
+        f"{wildcards.sample}_1." + "{lane}.fastq.gz")
     ).lane
 
 def aggregate_aligned_lanes(wildcards):
@@ -173,17 +182,21 @@ def aggregate_aligned_lanes(wildcards):
     return [os.path.join(out_dir, f"{wildcards.sample}.{lane}.sort.bam") for lane in lanes]
 
 rule sorted_merged_bam:
-    output: os.path.join(out_dir,"{sample,[^._]+}.sort.bam")
-    input: aggregate_aligned_lanes
-    threads: 5
+    output: temp(os.path.join(out_dir,"{sample,[^._]+}.sort.bam"))
+    input:
+        bams=aggregate_aligned_lanes,
+        fq1_dir=os.path.join(out_dir, "{sample}_fastq", "{sample}_1_fastq"),
+        fq2_dir=os.path.join(out_dir, "{sample}_fastq", "{sample}_2_fastq"),
+        f1_split_flag=os.path.join(out_dir, "{sample}_fastq", "done"),
+    threads: 24
     benchmark: os.path.join(out_dir,"log","{sample}.nsort.bam.log")
     log: os.path.join(out_dir,"log","{sample}.sort.bam.log")
     shell:
-        "samtools merge -@ {threads} {output} {input} 2> {log}"
+        "samtools merge -@ {threads} {output} {input.bams} 2> {log}"
 
 
 rule sort_bam_lane:
-    output: os.path.join(out_dir,"{sample,[^._]+}.{lane}.sort.bam")
+    output: temp(os.path.join(out_dir,"{sample,[^._]+}.{lane}.sort.bam"))
     input: os.path.join(out_dir,"{sample}.{lane}.fm.bam")
     threads: 5
     benchmark: os.path.join(out_dir,"benchmark","{sample}.{lane}.sort.bam")
@@ -196,7 +209,7 @@ rule sort_bam_lane:
         "samtools sort -o {output} -@ {threads} -m 1500M {input} -T {params.tmp_prefix} 2> {log}"
 
 rule fixmate_lane:
-    output: os.path.join(out_dir,"{sample,[^._]+}.{lane}.fm.bam")
+    output: temp(os.path.join(out_dir,"{sample,[^._]+}.{lane}.fm.bam"))
     input: os.path.join(out_dir,"{sample}.{lane}.bam")
     log: os.path.join("log","{sample,[^_]+}.{lane}.fm.bam.log")
     resources:
@@ -212,10 +225,10 @@ rule fixmate_lane:
         " 2> {log}"
 
 rule align_lane:
-    output: os.path.join(out_dir,"{sample,[^._]+}.{lane}.bam")
+    output: temp(os.path.join(out_dir,"{sample,[^._]+}.{lane}.bam"))
     input:
-        r1=os.path.join(out_dir, "{sample}_fastq", "{sample}_1_fastq", "{sample}_1.{lane}.fastq"),
-        r2=os.path.join(out_dir, "{sample}_fastq", "{sample}_2_fastq", "{sample}_2.{lane}.fastq"),
+        r1=os.path.join(out_dir, "{sample}_fastq", "{sample}_1_fastq", "{sample}_1.{lane}.fastq.gz"),
+        r2=os.path.join(out_dir, "{sample}_fastq", "{sample}_2_fastq", "{sample}_2.{lane}.fastq.gz"),
         target_ref=reference
     threads: 24
     log: os.path.join(out_dir, "log", "{sample}.{lane}.bam.log")
@@ -237,45 +250,46 @@ rule align_lane:
 
 
 checkpoint split_finish:
-    output: os.path.join(out_dir, "{sample,[^._]+}_fastq", "done")
+    output: temp(touch(os.path.join(out_dir, "{sample,[^._]+}_fastq", "done")))
     resources:
         time="00:00:05"
     input:
         r1=os.path.join(out_dir, "{sample}_fastq", "{sample}_1_fastq"),
         r2=os.path.join(out_dir,"{sample}_fastq","{sample}_2_fastq"),
-    shell: "touch {output}"
 
 
 rule split_into_lanes:
-    output: directory(os.path.join(out_dir, "{sample,[^._]+}_fastq", "{sample}_{n,\d}_fastq")),
+    output: temp(directory(os.path.join(out_dir, "{sample,[^._]+}_fastq", "{sample}_{n,\d}_fastq"))),
     input: os.path.join(out_dir, "{sample}_{n}.fastq.gz"),
     params:
         sample=lambda wc: wc.sample,
         rn=lambda wc: wc.n,
         sed_command=lambda wc: "sed 's/^@[^ ]* /@/g' |" if clean_rname else "",
+        d_threads=lambda wc, threads: max(1, int(threads) // 2),
+        c_threads=lambda wc, threads: max(1, int(threads) // 8),
     resources:
         time="3:00:00"
-    threads: 5
+    threads: 24
     benchmark: os.path.join(out_dir, "{sample}_fastq", "log", "{sample}_{n}_fastq")
     shell:
         "mkdir -p {output} && "
-        "bgzip -cd -@ {threads} {input} |"
+        "bgzip -cd -@ {params.d_threads} {input} |"
         " {params.sed_command}"
         " awk "
         "   '"
         "    BEGIN {{FS=\":\"}} "
-        "    {{ lane=$3\".\"$4 ; print > \"{output}/{params.sample}_{params.rn}.\"lane\".fastq\" ;"
+        "    {{ lane=$3\".\"$4 ; print $0 | \"bgzip -@ {params.c_threads} > {output}/{params.sample}_{params.rn}.\"lane\".fastq.gz\" ;"
         "       for (i = 1; i <= 3; i++) "
-        "           {{getline ; print > \"{output}/{params.sample}_{params.rn}.\"lane\".fastq\"}}"
+        "           {{getline ; print $0 | \"bgzip -@ {params.c_threads} > {output}/{params.sample}_{params.rn}.\"lane\".fastq.gz\"}}"
         "    }}"
         "   '"
 
 rule extract_reads:
     output:
-            r1=os.path.join(out_dir, "{sample,[^._]+}_1.fastq.gz"),
-            r2=os.path.join(out_dir, "{sample,[^._]+}_2.fastq.gz"),
-            z=os.path.join(out_dir, "{sample,[^._]+}_0.fastq.gz"),
-            s=os.path.join(out_dir, "{sample,[^._]+}_s.fastq.gz")
+            r1=temp(os.path.join(out_dir, "{sample,[^._]+}_1.fastq.gz")),
+            r2=temp(os.path.join(out_dir, "{sample,[^._]+}_2.fastq.gz")),
+            z=temp(os.path.join(out_dir, "{sample,[^._]+}_0.fastq.gz")),
+            s=temp(os.path.join(out_dir, "{sample,[^._]+}_s.fastq.gz")),
     input:
          source_ref=grch38_ref,
          bam=os.path.join(out_dir, "{sample}.nsorted.bam")
