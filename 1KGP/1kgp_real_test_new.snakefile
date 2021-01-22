@@ -5,12 +5,11 @@ grch38_ref=config.get("grch38_ref", reference)
 out_dir=config.get("out_dir", "new_2020")
 autosomes=[f"chr{x}" for x in range(1, 23)]
 gatk = "java -jar ~/code/aganezov/gatk-4.1.9.0/gatk-package-4.1.9.0-local.jar"
-# picard = "java -jar ~/code/aganezov/picard-tools-2.4.1/picard.jar"
 known_snps_from_dbSNP138 = "/scratch/groups/mschatz1/aganezov/CHM13/variants/1000G/from_ena/resources/Homo_sapiens_assembly38.dbsnp138.vcf"
 known_indels_from_mills_1000genomes = "/scratch/groups/mschatz1/aganezov/CHM13/variants/1000G/from_ena/resources/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz"
 known_indels = "/scratch/groups/mschatz1/aganezov/CHM13/variants/1000G/from_ena/resources/Homo_sapiens_assembly38.known_indels.vcf.gz"
 
-
+BENCHMARK_DIR = "benchmark"
 sample = config.get("sample", "ERR3239800")
 sample_cram = config.get("cram", os.path.join(out_dir, f"{sample}.final.cram"))
 clean_rname = config.get("clean_rnames", True)
@@ -30,7 +29,7 @@ rule samtools_stats:
         cram_crai=os.path.join(out_dir, "{sample}.cram.crai"),
         target_ref=reference,
     log: os.path.join(out_dir, "log", "{sample}.samtools.stats.txt.log")
-    benchmark: os.path.join(out_dir, "benchmarks", "{sample}.samtools_stats.benchmark.txt")
+    benchmark: os.path.join(out_dir, BENCHMARK_DIR, "{sample}.samtools_stats.benchmark.txt")
     threads: 24
     shell:
         "samtools stats -r {input.target_ref} --reference {input.target_ref} -@ {threads} {input.cram} > {output} 2> {log}"
@@ -48,7 +47,7 @@ rule mosdepth_stats:
         chm13_ref=reference,
     log: os.path.join(out_dir, "log", "{sample}.mosdepth.log")
     threads: 24
-    benchmark: os.path.join(out_dir, "benchmarks", "{sample}.mosdepth.benchmark.txt")
+    benchmark: os.path.join(out_dir, BENCHMARK_DIR, "{sample}.mosdepth.benchmark.txt")
     params:
         prefix=lambda wc: os.path.join(out_dir, f"{wc.sample}"),
     shell:
@@ -58,12 +57,13 @@ rule index_cram:
     output: cram_index=os.path.join(out_dir,"{sample,[^._]+}.cram.crai")
     input: cram=os.path.join(out_dir, "{sample}.cram")
     threads: 24
+    benchmark: os.path.join(out_dir, BENCHMARK_DIR, "{sample}.cram.crai")
     shell:
         "samtools index -@ {threads} {input}"
 
 rule bam_to_cram:
     output: os.path.join(out_dir, "{sample,[^._]+}.cram")
-    benchmark: os.path.join(out_dir, "benchmark", "{sample}.cram")
+    benchmark: os.path.join(out_dir, BENCHMARK_DIR, "{sample}.cram")
     input:
         bam=os.path.join(out_dir, "{sample}.recalibrated.sort.bam"),
         target_ref=reference
@@ -77,7 +77,7 @@ rule recalibrate_bam:
         dedup_sorted_index=os.path.join(out_dir, "{sample}.dedup.sort.bam.bai"),
         target_ref=reference,
     log: os.path.join(out_dir, "log", "{sample}.recalibrated.sort.bam.log")
-    benchmark: os.path.join(out_dir, "benchmark", "{sample}.recalibrated.sort.bam")
+    benchmark: os.path.join(out_dir, BENCHMARK_DIR, "{sample}.recalibrated.sort.bam")
     threads: 24
     params:
         gatk_cli="~/code/aganezov/gatk-4.1.9.0/gatk",
@@ -111,7 +111,7 @@ rule get_recalibration_table:
         known_indels_from_mills_1000genomes=known_indels_from_mills_1000genomes,
         target_ref=reference,
     log: os.path.join(out_dir, "log", "{sample}.recal.table.log")
-    benchmark: os.path.join(out_dir, "benchmark", "{sample}.recal.table")
+    benchmark: os.path.join(out_dir, BENCHMARK_DIR, "{sample}.recal.table")
     threads: 24
     params:
         autosomes_flag = " ".join(f"-L {c}" for c in autosomes),
@@ -139,6 +139,7 @@ rule index_dedup_bam:
     input: os.path.join(out_dir, "{sample}.dedup.sort.bam")
     threads: 24
     log: os.path.join(out_dir, "log", "{sample}.dedup.sort.bam.bai.log")
+    benchmark: os.path.join(out_dir, BENCHMARK_DIR,"{sample}.dedup.sort.bam.bai")
     shell:
         "samtools index -@ {threads} {input} 2> {log}"
 
@@ -153,7 +154,7 @@ rule mark_duplicates:
         tmp_preifx=lambda wc: os.path.join(out_dir, f"samtools_{wc.sample}", f"{wc.sample}"),
         tmp_dir=lambda wc: os.path.join(out_dir, f"samtools_{wc.sample}"),
     log: os.path.join(out_dir, "log", "{sample}.dedup.sort.bam.log")
-    benchmark: os.path.join(out_dir, "benchmark", "{sample}.dedup.bam")
+    benchmark: os.path.join(out_dir, BENCHMARK_DIR, "{sample}.dedup.bam")
     threads: 24
     shell:
         "mkdir -p {params.tmp_dir} &&"
@@ -189,7 +190,7 @@ rule sorted_merged_bam:
         fq2_dir=os.path.join(out_dir, "{sample}_fastq", "{sample}_2_fastq"),
         f1_split_flag=os.path.join(out_dir, "{sample}_fastq", "done"),
     threads: 24
-    benchmark: os.path.join(out_dir,"log","{sample}.nsort.bam.log")
+    benchmark: os.path.join(out_dir,BENCHMARK_DIR,"{sample}.sort.bam")
     log: os.path.join(out_dir,"log","{sample}.sort.bam.log")
     shell:
         "samtools merge -@ {threads} {output} {input.bams} 2> {log}"
@@ -199,7 +200,7 @@ rule sort_bam_lane:
     output: temp(os.path.join(out_dir,"{sample,[^._]+}.{lane}.sort.bam"))
     input: os.path.join(out_dir,"{sample}.{lane}.fm.bam")
     threads: 5
-    benchmark: os.path.join(out_dir,"benchmark","{sample}.{lane}.sort.bam")
+    benchmark: os.path.join(out_dir,BENCHMARK_DIR,"{sample}.{lane}.sort.bam")
     log: os.path.join(out_dir,"log","{sample}.{lane}.sort.bam.log")
     resources:
         time="00:30:00"
@@ -214,7 +215,7 @@ rule fixmate_lane:
     log: os.path.join("log","{sample,[^_]+}.{lane}.fm.bam.log")
     resources:
         time="2:00:00"
-    benchmark: os.path.join(out_dir, "benchmark", "{sample}.{lane}.fm.bam")
+    benchmark: os.path.join(out_dir, BENCHMARK_DIR, "{sample}.{lane}.fm.bam")
     threads: 5
     shell:
         "samtools"
@@ -237,7 +238,7 @@ rule align_lane:
     params:
         rg_tag=lambda
             wc: f"@RG\\tID:{wc.sample}_{wc.lane.replace('.','_')}\\tPL:illumina\\tPM:Unknown\\tLB:{wc.sample}\\tDS:GRCh38\\tSM:{wc.sample}\\tCN:NYGenome\\tPU:{wc.lane.replace('.','_')}",
-    benchmark: os.path.join(out_dir, "benchmark", "{sample}.{lane}.bam")
+    benchmark: os.path.join(out_dir, BENCHMARK_DIR, "{sample}.{lane}.bam")
     shell:
         "bwa mem -Y"
         " -K 100000000"
@@ -270,7 +271,7 @@ rule split_into_lanes:
     resources:
         time="3:00:00"
     threads: 24
-    benchmark: os.path.join(out_dir, "{sample}_fastq", "log", "{sample}_{n}_fastq")
+    benchmark: os.path.join(out_dir, BENCHMARK_DIR, "{sample}_{n}_fastq")
     shell:
         "mkdir -p {output} && "
         "bgzip -cd -@ {params.d_threads} {input} |"
@@ -295,7 +296,7 @@ rule extract_reads:
          bam=os.path.join(out_dir, "{sample}.nsorted.bam")
     log: os.path.join(out_dir, "log", "{sample}.reads_extract.log")
     threads: 24
-    benchmark: "benchmarks/{sample}.read_extraction.benchmark.txt"
+    benchmark: os.path.join(out_dir, BENCHMARK_DIR, "{sample}.read_extraction.benchmark.txt")
     shell:
         "samtools fastq -@ {threads} -c 2 -1 {output.r1} -2 {output.r2} -0 {output.z} -s {output.s} -n --reference {input.source_ref} {input.bam} &> {log}"
 
@@ -309,7 +310,7 @@ rule name_sort_cram:
     params:
         samtools_prefix=lambda wc: os.path.join(out_dir, f"{wc.sample_id}_samtools_nsort_tmp")
     log: os.path.join(out_dir, "log", "{sample_id}.nsorted.cram.log")
-    benchmark: os.path.join(out_dir, "benchmarks", "{sample_id}.cram_nsort.benchmark.txt")
+    benchmark: os.path.join(out_dir, BENCHMARK_DIR, "{sample_id}.cram_nsort.benchmark.txt")
     shell:
         "samtools sort -n -@ {threads} -O bam -o {output} -m {resources.mem_mb}M -T {params.samtools_prefix} --reference {input.source_ref} {input.cram} &> {log}"
 
