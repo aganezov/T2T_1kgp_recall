@@ -1,0 +1,353 @@
+import os
+
+sample1 = "test"
+
+out_dir = "/data/avdeevpv/1kgp/data/smtst/output/"
+log_dir = "/data/avdeevpv/1kgp/data/smtst/output/log"
+bench_dir = "/data/avdeevpv/1kgp/data/smtst/output/bench"
+
+reference_dir = "/data/avdeevpv/1kgp/data/ref/"
+reference_name = "GRCh38_full_analysis_set_plus_decoy_hla.fa"
+
+splitter_cli = "/data/avdeevpv/1kgp/tools/lanesep"
+# gatk_cli = "~/code/aganezov/gatk-4.1.9.0/gatk"
+
+optical_dup_distance = 100
+# known_snps_from_dbSNP138 = "/scratch/groups/mschatz1/aganezov/CHM13/variants/1000G/from_ena/resources/Homo_sapiens_assembly38.dbsnp138.vcf"
+# known_indels_from_mills_1000genomes = "/scratch/groups/mschatz1/aganezov/CHM13/variants/1000G/from_ena/resources/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz"
+# known_indels = "/scratch/groups/mschatz1/aganezov/CHM13/variants/1000G/from_ena/resources/Homo_sapiens_assembly38.known_indels.vcf.gz"
+#
+# autosomes = [f"chr{x}" for x in range(1, 23)]
+
+rule finish:
+    input:
+        cram_index = os.path.join(out_dir, "crams", f"{sample1}.cram.crai"),
+        cram = os.path.join(out_dir, "crams", f"{sample1}.cram"),
+        samtools_stat = os.path.join(out_dir, "stats", f"{sample1}.samtools.stats.txt"),
+        mosdepth_stats=os.path.join(out_dir, "stats", f"{sample1}.mosdepth.global.dist.txt")
+
+rule split_into_lanes:
+    input: os.path.join(out_dir, "input", "{sample}_{n}.fastq.gz"),
+    output: directory(os.path.join(out_dir, "split", "{sample}_{n,\d}_fastq")),
+    params:
+        splitter = splitter_cli,
+        loc_name = lambda wc: wc.sample + "_" + wc.n + "_fastq",
+        sample = lambda wc: wc.sample,
+        rn = lambda wc: wc.n,
+    priority: 10
+    resources:
+        time = "3:00:00"
+    threads: 1
+    shell:
+         """
+             export TMPDIR=/lscratch/$SLURM_JOB_ID
+
+             mkdir -p $TMPDIR/{params.loc_name} 
+             cd $TMPDIR/{params.loc_name}
+         
+             {params.splitter} {input} {params.sample}_{params.rn}
+         
+             mkdir -p {output}
+             mv $TMPDIR/{params.loc_name}/* {output}/
+             rm -r $TMPDIR/{params.loc_name}
+         """
+
+checkpoint split_finish:
+    output: temp(os.path.join(out_dir, "split", "{sample,[^._]+}_fastq_done"))
+    input:
+        r1 = os.path.join(out_dir, "split", "{sample}_1_fastq"),
+        r2 = os.path.join(out_dir, "split", "{sample}_2_fastq"),
+    resources:
+        time = "00:00:05"
+    shell: "touch {output}"
+
+# bam index
+rule align_lane:
+    output: temp(os.path.join(out_dir, "align", "{sample,[^._]+}.{lane}.bam"))
+    input:
+        r1 = os.path.join(out_dir, "split", "{sample}_1_fastq", "{sample}_1.{lane}.fastq.gz"),
+        r2 = os.path.join(out_dir, "split", "{sample}_2_fastq", "{sample}_2.{lane}.fastq.gz"),
+        ref_dir = reference_dir
+    benchmark: os.path.join(bench_dir, "align", "{sample}.{lane}.bam.bench")
+    log: os.path.join(log_dir, "align", "{sample}.{lane}.bam.log")
+    params:
+        loc_name = lambda wc: wc.sample + "." + wc.lane + ".bam",
+        ref_name = reference_name,
+        rg_tag = lambda
+            wc: f"@RG\\tID:{wc.sample}_{wc.lane.replace('.','_')}\\tPL:illumina\\tPM:Unknown\\tLB:{wc.sample}\\tDS:GRCh38\\tSM:{wc.sample}\\tCN:NYGenome\\tPU:{wc.lane.replace('.','_')}",
+    threads: 24
+    priority: 20
+    resources:
+        time = "3:00:00"
+    shell:
+        """
+            export TMPDIR=/lscratch/$SLURM_JOB_ID
+            cd $TMPDIR
+            
+            cp {input.ref_dir}/* $TMPDIR/
+            
+            bwa mem -Y -K 100000000 -t {threads} -R \"{params.rg_tag}\" $TMPDIR/{params.ref_name} {input.r1} {input.r2} 2> {log} | samtools view -Shb -o {params.loc_name} -
+            
+            mv {params.loc_name} {output}
+        """
+
+rule fixmate_lane:
+    output: temp(os.path.join(out_dir, "fixmate", "{sample,[^._]+}.{lane}.fm.bam"))
+    input: os.path.join(out_dir, "align", "{sample}.{lane}.bam")
+    log: os.path.join(log_dir, "fixmate", "{sample,[^_]+}.{lane}.fm.bam.log")
+    benchmark: os.path.join(bench_dir, "fixmate", "{sample}.{lane}.fm.bam.bench")
+    params:
+        loc_name = lambda wc: wc.sample + "." + wc.lane + ".fm.bam",
+    priority: 30
+    resources:
+        time="2:00:00"
+    threads: 4
+    shell:
+        """
+            export TMPDIR=/lscratch/$SLURM_JOB_ID
+            cd $TMPDIR
+
+            samtools fixmate -m -@ {threads} {input} {params.loc_name} 2> {log}
+            
+            mv {params.loc_name} {output} 
+        """
+
+rule sort_bam_lane:
+    output: temp(os.path.join(out_dir, "sort", "{sample,[^._]+}.{lane}.sort.bam"))
+    input: os.path.join(out_dir, "fixmate", "{sample}.{lane}.fm.bam")
+    benchmark: os.path.join(bench_dir, "sort", "{sample}.{lane}.sort.bam.bench")
+    log: os.path.join(log_dir, "sort", "{sample}.{lane}.sort.bam.log")
+    params:
+        loc_name = lambda wc: wc.sample + "." + wc.lane + ".sort.bam",
+    threads: 4
+    priority: 40
+    resources:
+        time = "00:30:00"
+    shell:
+        """
+            export TMPDIR=/lscratch/$SLURM_JOB_ID
+            cd $TMPDIR
+             
+            samtools sort -o {params.loc_name} -@ {threads} -m 1500M {input} -T $TMPDIR 2> {log} 
+             
+            mv {params.loc_name} {output} 
+        """
+
+def aggregate_lanes(wildcards):
+    checkpoint_output = os.path.dirname(checkpoints.split_finish.get(**wildcards).output[0])
+    return glob_wildcards(os.path.join(
+        checkpoint_output,
+        f"{wildcards.sample}_1_fastq",
+        f"{wildcards.sample}_1." + "{lane}.fastq.gz")
+    ).lane
+
+def aggregate_aligned_lanes(wildcards):
+    lanes = aggregate_lanes(wildcards)
+    return [os.path.join(out_dir, "sort", f"{wildcards.sample}.{lane}.sort.bam") for lane in lanes]
+
+rule merge_bam:
+    output: temp(os.path.join(out_dir, "merge", "{sample,[^._]+}.sort.bam"))
+    input:
+        bams = aggregate_aligned_lanes,
+        f1_split_flag = os.path.join(out_dir, "split", "{sample}_fastq_done"),
+    benchmark: os.path.join(bench_dir, "merge", "{sample}.sort.bam.bench")
+    log: os.path.join(log_dir, "merge", "{sample}.sort.bam.log")
+    params:
+        loc_name = lambda wc: wc.sample + ".sort.bam",
+    priority: 50
+    threads: 24
+    shell:
+        """
+            export TMPDIR=/lscratch/$SLURM_JOB_ID
+            cd $TMPDIR
+             
+            samtools merge -@ {threads} {params.loc_name} {input.bams} 2> {log} 
+             
+            mv {params.loc_name} {output}
+        """
+
+rule mark_duplicates:
+    output: os.path.join(out_dir, "dedup", "{sample,[^._]+}.dedup.sort.bam")
+    input: os.path.join(out_dir, "merge", "{sample}.sort.bam")
+    log: os.path.join(log_dir, "dedup", "{sample}.dedup.sort.bam.log")
+    benchmark: os.path.join(bench_dir, "dedup", "{sample}.dedup.bam")
+    params:
+        dedup_metrics = lambda wc: os.path.join(out_dir, "dedup", f"{wc.sample}.txt"),
+        opt_dup_dist = optical_dup_distance,
+        sample = lambda wc: wc.sample,
+        loc_name = lambda wc: wc.sample + ".dedup.sort.bam",
+    threads: 4
+    priority: 60
+    shell:
+        """
+            export TMPDIR=/lscratch/$SLURM_JOB_ID
+            cd $TMPDIR
+  
+            if [ ! -d "tmpsam" ] 
+            then
+                mkdir tmpsam
+            fi
+            
+            samtools markdup -@ {threads} -S -T tmpsam/{params.sample} -s -f dedup_stat.txt -d {params.opt_dup_dist} {input} {params.loc_name} 2> {log}
+                             
+            mv dedup_stat.txt {params.dedup_metrics}
+            mv {params.loc_name} {output}
+        """
+
+rule index_dedup_bam:
+    output: os.path.join(out_dir, "dedup", "{sample,[^._]+}.dedup.sort.bam.bai")
+    input: os.path.join(out_dir, "dedup", "{sample}.dedup.sort.bam")
+    log: os.path.join(log_dir, "dedup", "{sample}.dedup.sort.bam.bai.log")
+    threads: 24
+    priority: 70
+    shell:
+        "samtools index -@ {threads} {input} 2> {log}"
+
+# rule get_recalibration_table:
+#     output: os.path.join(out_dir, "tables", "{sample,[^._]+}.recal.table")
+#     input:
+#         dedup_sorted_bam = os.path.join(out_dir, "dedup", "{sample}.dedup.sort.bam"),
+#         dedup_sorted_index = os.path.join(out_dir, "dedup", "{sample}.dedup.sort.bam.bai"),
+#         ref_dir = reference_dir,
+#         known_snps_from_dbSNP138 = known_snps_from_dbSNP138,
+#         known_indels = known_indels,
+#         known_indels_from_mills_1000genomes = known_indels_from_mills_1000genomes,
+#     log: os.path.join(log_dir, "tables", "{sample}.recal.table.log")
+#     benchmark: os.path.join(bench_dir, "tables", "{sample}.recal.table")
+#     params:
+#         ref_name = reference_name,
+#         loc_name = lambda wc: wc.sample + ".recal.table",
+#         autosomes_flag = " ".join(f"-L {c}" for c in autosomes),
+#         gatk = gatk_cli
+#     shell:
+#         """
+#             export TMPDIR=/lscratch/$SLURM_JOB_ID
+#             cd $TMPDIR
+#
+#             cp {input.ref_dir}/* $TMPDIR/
+#
+#             {params.gatk} BaseRecalibrator --preserve-qscores-less-than 6 {params.autosomes_flag} \
+#                     -R {params.ref_name} -O {params.loc_name} -I {input.dedup_sorted_bam} \
+#                     --known-sites {input.known_snps_from_dbSNP138} \
+#                     --known-sites {input.known_indels} \
+#                     --known-sites {input.known_indels_from_mills_1000genomes} 2> log.txt
+#
+#             mv log.txt {log}
+#             mv {params.loc_name} {output}
+#         """
+#
+# rule recalibrate_bam:
+#     output: os.path.join(out_dir, "recalibrate", "{sample,[^._]+}.recalibrated.sort.bam")
+#     input:
+#         table=os.path.join(out_dir, "tables", "{sample}.recal.table"),
+#         dedup_sorted_bam=os.path.join(out_dir, "dedup", "{sample}.dedup.sort.bam"),
+#         dedup_sorted_index=os.path.join(out_dir, "dedup", "{sample}.dedup.sort.bam.bai"),
+#         ref_dir=reference_dir
+#     log: os.path.join(log_dir, "recalibrate", "{sample}.recalibrated.sort.bam.log")
+#     benchmark: os.path.join(bench_dir, "recalibrate", "{sample}.recalibrated.sort.bam")
+#     threads: 24
+#     params:
+#         gatk_=gatk_cli,
+#         ref_name = reference_name,
+#         java_options='--java-options \"-Xmx32G -XX:ParallelGCThreads=4 -Djava.io.tmpdir=/dev/shm\"',
+#     shell:
+#          """
+#             export TMPDIR=/lscratch/$SLURM_JOB_ID
+#             cd $TMPDIR
+#
+#             cp {input.ref_dir}/* $TMPDIR/
+#
+#             {params.gatk} ApplyBQSRSpark {params.java_options} --spark-runner LOCAL \
+#             --spark-master \'local[{threads}]\' \
+#             --preserve-qscores-less-than 6
+#             --static-quantized-quals 10
+#             --static-quantized-quals 20
+#             --static-quantized-quals 30
+#             --tmp-dir /dev/shm
+#             --read-filter GoodCigarReadFilter
+#             -R {params.ref_name}
+#             -O {params.loc_name}
+#             -I {input.dedup_sorted_bam}
+#             --bqsr-recal-file {input.table} 2> log.txt
+#
+#             mv log.txt {log}
+#             mv {params.loc_name} {output}
+#          """
+
+rule bam_to_cram:
+    output: os.path.join(out_dir, "crams", "{sample,[^._]+}.cram")
+    input:
+        bam=os.path.join(out_dir, "dedup", "{sample}.dedup.sort.bam"),
+        ref_dir=reference_dir
+    benchmark: os.path.join(bench_dir, "crams", "{sample}.cram")
+    params:
+        loc_name=lambda wc: wc.sample + ".cram",
+        ref_name=reference_name,
+    shell:
+        """
+            export TMPDIR=/lscratch/$SLURM_JOB_ID
+            cd $TMPDIR
+
+            cp {input.ref_dir}/* $TMPDIR/
+
+            samtools view -C -T {params.ref_name} -o {params.loc_name} {input.bam}
+
+            mv {params.loc_name} {output}
+        """
+
+
+rule index_cram:
+    output: os.path.join(out_dir, "crams", "{sample,[^._]+}.cram.crai")
+    input: os.path.join(out_dir, "crams", "{sample}.cram")
+    threads: 24
+    shell:
+         "samtools index -@ {threads} {input}"
+
+rule samtools_stats:
+    output: os.path.join(out_dir, "stats", "{sample,[^._]+}.samtools.stats.txt"),
+    input:
+        cram=os.path.join(out_dir, "crams", "{sample}.cram"),
+        cram_crai=os.path.join(out_dir, "crams", "{sample}.cram.crai"),
+        ref_dir=reference_dir 
+    log: os.path.join(log_dir, "stats", "{sample}.samtools.stats.txt.log")
+    benchmark: os.path.join(bench_dir, "stats", "{sample}.samtools_stats.benchmark.txt")
+    params:
+        ref_name=reference_name,
+    threads: 24
+    shell:
+        """
+            export TMPDIR=/lscratch/$SLURM_JOB_ID
+            cd $TMPDIR
+
+            cp {input.ref_dir}/* $TMPDIR/
+            
+            samtools stats -r {params.ref_name} --reference {params.ref_name} -@ {threads} {input.cram} > {output} 2> {log}
+        """
+
+rule mosdepth_stats:
+    output:
+        global_dist=os.path.join(out_dir, "stats", "{sample,[^._]+}.mosdepth.global.dist.txt"),
+        regions_dist=os.path.join(out_dir, "stats", "{sample,[^._]+}.mosdepth.region.dist.txt"),
+        summary=os.path.join(out_dir, "stats", "{sample,[^._]+}.mosdepth.summary.txt"),
+        regions_bed=os.path.join(out_dir, "stats", "{sample,[^._]+}.regions.bed.gz"),
+        regions_bed_i=os.path.join(out_dir, "stats", "{sample,[^._]+}.regions.bed.gz.csi"),
+    input:
+        cram=os.path.join(out_dir, "crams", "{sample}.cram"),
+        cram_index=os.path.join(out_dir, "crams", "{sample}.cram.crai"),
+        ref_dir=reference_dir
+    log: os.path.join(log_dir, "stats", "{sample}.mosdepth.log")
+    threads: 24
+    benchmark: os.path.join(bench_dir, "stats", "{sample}.mosdepth.benchmark.txt")
+    params:
+        prefix=lambda wc: os.path.join(out_dir, "stats", f"{wc.sample}"),
+        ref_name=reference_name,
+    shell:
+        """
+            export TMPDIR=/lscratch/$SLURM_JOB_ID
+            cd $TMPDIR
+            
+            cp {input.ref_dir}/* $TMPDIR/
+
+            mosdepth -n --fast-mode --by 500 -t {threads} --fasta {params.ref_name} {params.prefix} {input.cram} &> {log}
+        """
+

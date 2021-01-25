@@ -1,0 +1,10 @@
+[package]
+name = "lanesep"
+version = "0.1.0"
+authors = ["Pavel Avdeyev <avdeevp@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+fastq = "0.6.0"
+ahash = "0.4.4"
+flate2 = "1.0"
