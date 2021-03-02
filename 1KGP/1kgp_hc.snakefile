@@ -1,4 +1,6 @@
 import os
+from collections import defaultdict
+from pprint import pprint
 
 reference = config["ref"]
 
@@ -6,6 +8,7 @@ out_dir = config.get("out_dir","output_var")
 alignment_dir = config.get("alignment_dir", "")
 
 gatk_cli = config.get("gatk_cli", "gatk")
+bcftools_cli = config.get("bcftools", "bcftools")
 
 known_snps_from_dbSNP138 = config.get("dbsnp38_snps", "/scratch/groups/mschatz1/aganezov/CHM13/variants/1000G/from_ena/resources/Homo_sapiens_assembly38.dbsnp138.vcf")
 known_indels_from_mills_1000genomes = config.get("mills_indels", "/scratch/groups/mschatz1/aganezov/CHM13/variants/1000G/from_ena/resources/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz")
@@ -16,6 +19,28 @@ kg_snps = config.get("kgp_snps", "/scratch/groups/mschatz1/aganezov/CHM13/varian
 
 regions = config.get("regions", [f"chr{x}" for x in range(1, 23)])
 regions_regex = "(" + "|".join(regions) + ")"
+
+regions_lengths_file = config["regions_boundaries"]
+regions_boundaries = {}
+with open(regions_lengths_file, "rt") as source:
+    for line in source:
+        line = line.strip()
+        r, start, end = line.split("\t")
+        start, end = int(start), int(end)
+        regions_boundaries[r] = (start, end)
+
+
+intervals = defaultdict(list)
+int_size = config.get("interval", 1_000_000)
+margin = config.get("margin", 10_000)
+assert int_size >= margin
+
+for r, (start, end) in regions_boundaries.items():
+    b = 0
+    for b in range(start, end - int_size, int_size):
+        intervals[r].append((b, b + int_size))
+    intervals[r].append((b + int_size, end))
+
 
 cohort = config["cohort"]
 samples = config["samples"]
@@ -146,7 +171,7 @@ rule create_recalibration_indel_data:
         " &> {log}"
 
 
-rule gather_genotyped_vcfs:
+rule gather_genotyped_vcfs_total:
     output: temp(os.path.join(out_dir,"{cohort,[^._]+}.genotyped.vcf"))
     input: [os.path.join(out_dir, "{cohort}." + f"{region}.genotyped.vcf") for region in regions]
     threads: 4
@@ -163,23 +188,85 @@ rule gather_genotyped_vcfs:
         " -O {output}"
         " &> {log}"
 
-rule genotype_genomicsdb:
-    output: temp(os.path.join(out_dir,"{cohort,[^._]+}.{region}.genotyped.vcf"))
+
+rule concat_genotyped_vcfs_chromosome:
+    output: temp(os.path.join(out_dir,"{cohort,[^._]+}.{region,[^._]+}.genotyped.vcf"))
     input:
-        target_ref=reference,
-        gdb_flag=os.path.join(out_dir, "{cohort}.{region}.gdb.done")
+        vcfs=lambda wc: [os.path.join(out_dir, f"{wc.cohort}.{wc.region}.{rstart}_{rend}.genotyped.vcf.gz") for rstart, rend in intervals[wc.region]],
+        indexes=lambda wc: [os.path.join(out_dir, f"{wc.cohort}.{wc.region}.{rstart}_{rend}.genotyped.vcf.gz.csi") for rstart, rend in intervals[wc.region]],
     threads: 4
     log: os.path.join(out_dir,"log","{cohort}.{region}.genotyped.vcf")
     benchmark: os.path.join(out_dir,"benchmark","{cohort}.{region}.genotyped.vcf")
     params:
+        bcftools_cli = bcftools_cli,
+        inputs = lambda wc: " ".join(os.path.join(out_dir, f"{wc.cohort}.{wc.region}.{rstart}_{rend}.genotyped.vcf.gz") for rstart, rend in intervals[wc.region]),
+    shell:
+        "{params.bcftools_cli}"
+        " concat -a -d none"
+        " {params.inputs}"
+        " -o {output}"
+        " &> {log}"
+
+rule index_bgzip_vcf:
+    output: temp(os.path.join(out_dir, "{prefix}.genotyped.vcf.gz.csi"))
+    input: os.path.join(out_dir, "{prefix}.genotyped.vcf.gz")
+    threads: 4
+    params:
+        bcftools_cli = bcftools_cli,
+    shell:
+        "{params.bcftools_cli} index --threads {threads} {input}"
+
+rule bgzip_vcf:
+    output: temp(os.path.join(out_dir, "{prefix}.genotyped.vcf.gz"))
+    input: os.path.join(out_dir, "{prefix}.genotyped.vcf")
+    threads: 4
+    shell:
+        "bgzip -c -@ {threads} {input} > {output}"
+
+rule trim_margin_region_vcf:
+    output: os.path.join(out_dir, "{cohort}.{region,[^._]+}.{rstart,\d+}_{rend,\d+}.genotyped.vcf")
+    input:
+        vcf=lambda wc: os.path.join(out_dir,
+            f"{wc.cohort}.{wc.region}.{max(int(wc.rstart) - margin, regions_boundaries[wc.region][0])}_{min(int(wc.rend) + margin, regions_boundaries[wc.region][1])}.margined.genotyped.vcf"),
+        target_ref=reference,
+    threads: 4
+    log: os.path.join(out_dir,"log","{cohort}.{region}.{rstart}_{rend}.trimmed")
+    benchmark: os.path.join(out_dir,"benchmark","{cohort}.{region}.{rstart}_{rend}.trimmed")
+    params:
         gatk_cli = gatk_cli,
         java_options = lambda wc, threads: f'--java-options \"-Xmx8G -XX:+UseParallelGC -XX:ParallelGCThreads={threads} -Djava.io.tmpdir=/dev/shm\"',
-        gdb_dir_path = lambda wc: os.path.join(out_dir, f"{wc.cohort}.{wc.region}.gdb")
+        trimmed_interval = lambda wc: f"{wc.region}:{wc.rstart}-{int(wc.rend)}",
     shell:
         "{params.gatk_cli}"
+        " {params.java_options}"
+        " SelectVariants"
+        " -R {input.target_ref}"
+        " -V {input.vcf}"
+        " -L {params.trimmed_interval}"
+        " -O {output}"
+        " &> {log}"
+
+
+rule genotype_interval_genomicsdb:
+    output: temp(os.path.join(out_dir,"{cohort,[^._]+}.{region,[^._]+}.{rstart,\d+}_{rend,\d+}.margined.genotyped.vcf"))
+    input:
+        target_ref=reference,
+        gdb_flag=os.path.join(out_dir, "{cohort}.{region}.gdb.done")
+    threads: 4
+    log: os.path.join(out_dir,"log","{cohort}.{region}.{rstart}_{rend}.genotyped.vcf")
+    benchmark: os.path.join(out_dir,"benchmark","{cohort}.{region}.{rstart}_{rend}.genotyped.vcf")
+    params:
+        gatk_cli = gatk_cli,
+        java_options = lambda wc, threads: f'--java-options \"-Xmx8G -XX:+UseParallelGC -XX:ParallelGCThreads={threads} -Djava.io.tmpdir=/dev/shm\"',
+        gdb_dir_path = lambda wc: os.path.join(out_dir, f"{wc.cohort}.{wc.region}.gdb"),
+        interval_string = lambda wc: f"{wc.region}:{wc.rstart}-{wc.rend}",
+    shell:
+        "{params.gatk_cli}"
+        " {params.java_options}"
         " GenotypeGVCFs"
         " -R {input.target_ref}"
         " -O {output}"
+        " -L {params.interval_string}"
         " -V gendb://{params.gdb_dir_path}"
         " &> {log}"
 
